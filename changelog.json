@@ -1,0 +1,21 @@
+[
+  {
+    "version": "v0.1.0",
+    "date": "03/08/2026",
+    "title": "Initial Release",
+    "description": "Tool declaration block for .void files — mark an existing request as a named, typed capability an AI agent can call directly.",
+    "changes": {
+      "Added": [
+        "Tool block (/tool) with identity (name/title/description/annotations), a parameters table (agent-supplied vs environment-only source), and a verification policy (verifies rows with role/cadence/mode, plus a tool-level on-failure)",
+        "Dynamic MCP serving — a verified tool is registered as a real, individually-named/described/typed MCP tool by @voiden/mcp-server and voiden-runner mcp serve, alongside the 4 generic run/list/write tools every project already gets. A failing tool is withdrawn by default, or served with a degraded note if onFailure: advertise-degraded",
+        "Manual enabled override on the tool block — add or remove it from the served set regardless of verification state, editable from the Voiden app's MCP tab (List / Verify / Serve preview)",
+        "Environment-sourced params resolve from the project's .voiden/env-public.yaml / env-private.yaml when it has exactly one environment defined, not just the server process's own OS environment",
+        "A verify entry (or a tool's own request) targeting a file with no request-separators — i.e. just one request, nothing to disambiguate — no longer needs its sectionLabel to match anything",
+        "voiden-runner tool list — discovers every /tool block across a project",
+        "voiden-runner tool verify — runs each tool's verification requests and reports verified/unverified/failing, with --cadence filtering and --json/--write output modes",
+        "voiden-runner mcp serve [--http] [--check] — serves a project live over MCP (stdio or streamable-HTTP), or reports served/withdrawn/degraded/excluded without starting a session",
+        "Load-time structural validation (unbound/unresolved placeholders, dangling verification references, duplicate tool names, read-only tools on mutating requests) — a tool with any of these is excluded from the served set, reported separately from a verification failure"
+      ]
+    }
+  }
+]

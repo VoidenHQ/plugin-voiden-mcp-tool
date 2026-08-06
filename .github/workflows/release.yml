@@ -1,0 +1,33 @@
+name: Release Plugin
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: corepack enable
+      - run: npm install
+      - name: Build bundle
+        run: node build.mjs
+      - name: Build runner bundle
+        run: node build-runner.mjs
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/voiden-mcp-tool.js
+            dist/changelog.json
+            dist/voiden-mcp-tool-runner.js
+            src/skill.md
+            manifest.json
