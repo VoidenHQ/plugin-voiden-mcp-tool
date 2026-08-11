@@ -400,7 +400,19 @@ async function planServedTools(
 ): Promise<ServeDecision[]> {
   const tools = await discoverTools(primitives, extractFn, projectRoot, { activePlugins })
   const { validTools, issues } = await validateTools(primitives, projectRoot, tools)
-  const statuses = await verifyTools(primitives, validTools, { env, activePlugins })
+  // Same env-resolution rule registerServedTools() already applies for an
+  // actually-served tool's real calls (project vars first, so the explicit/
+  // process env passed in — e.g. .mcp.json's "env" block — still wins on a
+  // collision) — applied here too, so verification sees exactly what a real
+  // call would. Without this, a tool's own request or its verify-target
+  // requests can fail verification purely because the headless server
+  // process wasn't separately handed a variable that already lives in the
+  // project's own .voiden/env-public.yaml / env-private.yaml, even though
+  // calling the tool afterward would have resolved it fine — the app's own
+  // Preview Serve panel never had this gap, since it verifies through the
+  // editor's live active-environment pipeline instead of a bare process env.
+  const resolvedEnv: Record<string, string> = { ...loadProjectEnvironmentVars(projectRoot), ...env }
+  const statuses = await verifyTools(primitives, validTools, { env: resolvedEnv, activePlugins })
   return [...decideExcluded(issues), ...decideServing(statuses)]
 }
 
