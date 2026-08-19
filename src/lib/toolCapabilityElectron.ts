@@ -44,8 +44,11 @@ export interface ToolExtraction {
   requestUid?: string
   params: ToolParamDef[]
   verifies: ToolVerifyEntry[]
-  onFailure: ToolOnFailure
   enabled: boolean
+  /** See toolBlocks.ts's ToolBlockConfig — absent means "not bound, use the
+   *  sibling request in this tool's own section" (the original behavior). */
+  requestFilePath?: string
+  requestSectionLabel?: string
 }
 
 export interface ToolDef extends ToolExtraction {
@@ -70,7 +73,7 @@ interface ToolStatus {
 
 interface ToolValidationIssue {
   tool: ToolDef
-  check: 'unbound-param' | 'unresolved-placeholder' | 'missing-section' | 'duplicate-name' | 'readonly-mutating'
+  check: 'unbound-param' | 'unresolved-placeholder' | 'missing-section' | 'duplicate-name' | 'readonly-mutating' | 'dangling-request-reference'
   message: string
 }
 
@@ -143,9 +146,24 @@ async function getSchemaAndExtensions() {
   return { schema: getSchema(allExtensions), allExtensions }
 }
 
+/** Cross-file references (tool.requestFilePath, a verify entry's filePath)
+ *  are saved relative to the project root (see Row.tsx's FilePickerCell) so
+ *  they survive being cloned to a different machine — resolve back to
+ *  absolute here, at the point of actually reading the file. A no-op for
+ *  paths already absolute (pre-fix saves, or tool.filePath itself, which
+ *  always comes from getVoidFiles() and is never relative), so this is safe
+ *  to apply unconditionally at every read site. Mirrors resolvePath() in
+ *  toolCapability.ts, the headless/CI counterpart of this same problem. */
+async function resolveCrossFilePath(filePath: string): Promise<string> {
+  const electron = (window as any).electron
+  const projectRoot: string | null = await electron?.directories?.getActive?.()
+  if (!projectRoot) return filePath
+  return (await electron?.path?.toAbsolute?.(projectRoot, filePath)) ?? filePath
+}
+
 async function parseFile(primitives: ElectronToolPrimitives, filePath: string, schema: any) {
   const { parseMarkdown } = await import(/* @vite-ignore */ '@/core/editors/voiden/markdownConverter')
-  const content = await primitives.readFile(filePath)
+  const content = await primitives.readFile(await resolveCrossFilePath(filePath))
   return parseMarkdown(content ?? '', schema)
 }
 
@@ -158,6 +176,23 @@ async function getFileSections(primitives: ElectronToolPrimitives, filePath: str
   const { schema } = await getSchemaAndExtensions()
   const doc = await parseFile(primitives, filePath, schema)
   return splitIntoSections(doc).map((s) => ({ index: s.index, label: s.label }))
+}
+
+/** A section's actual blocks (as plain JSON), for a file that may not be
+ *  open in any editor tab — powers auto-populate (ToolParamsNode.tsx) for
+ *  the cross-file-bound case, where there's no live editor doc to read from
+ *  directly the way the same-file case does. Same single-section-file
+ *  leniency as everywhere else: a file with no request-separators has
+ *  nothing to disambiguate, so any label (or none) means "the one section
+ *  present". Returns null when the file has multiple sections and none
+ *  matches — same "doesn't exist" case the dangling-request-reference
+ *  validation check already reports separately. */
+async function getSectionBlocks(primitives: ElectronToolPrimitives, filePath: string, sectionLabel: string): Promise<any[] | null> {
+  const { schema } = await getSchemaAndExtensions()
+  const doc = await parseFile(primitives, filePath, schema)
+  const sections = splitIntoSections(doc)
+  const section = sections.length === 1 ? sections[0] : sections.find((s) => s.label === sectionLabel)
+  return section ? section.blocks : null
 }
 
 // ─── Discovery ───────────────────────────────────────────────────────────
@@ -187,8 +222,9 @@ async function discoverTools(primitives: ElectronToolPrimitives): Promise<ToolDe
         requestUid: cfg.requestUid,
         params: cfg.params,
         verifies: cfg.verifies,
-        onFailure: cfg.onFailure,
         enabled: cfg.enabled,
+        requestFilePath: cfg.requestFilePath,
+        requestSectionLabel: cfg.requestSectionLabel,
         filePath: file.source,
         sectionLabel: section.label,
         sectionIndex: section.index,
@@ -209,6 +245,20 @@ function extractPlaceholders(text: string): Set<string> {
   let m: RegExpExecArray | null
   while ((m = re.exec(text)) !== null) found.add(m[1].trim())
   return found
+}
+
+/** Every param is agent-supplied at call time (see toolBlocks.ts's
+ *  ToolParamDef) — there's no agent present during verification, so this
+ *  substitutes each param's own testValue instead, keyed by binds. Mirrors
+ *  toolCapability.ts's own testValueEnv() — same reasoning, kept as a
+ *  separate copy here since this is a deliberately separate implementation
+ *  (see this file's header comment), not a shared module instance. */
+function testValueEnv(params: ToolParamDef[]): Record<string, string> {
+  const env: Record<string, string> = {}
+  for (const p of params) {
+    if (p.testValue !== undefined && p.testValue !== '') env[p.binds] = p.testValue
+  }
+  return env
 }
 
 async function validateTools(
@@ -246,8 +296,19 @@ async function validateTools(
 
   for (const tool of tools) {
     const sections = await getSections(tool.filePath)
-    const ownSection = sections[tool.sectionIndex]
-    const sectionText = JSON.stringify(ownSection?.blocks ?? [])
+    const isBound = tool.requestSectionLabel !== undefined
+
+    // Where THIS tool's own request actually lives — its own section by
+    // default, or wherever requestFilePath/requestSectionLabel points once
+    // bound (Pending #3 — cross-file/cross-section request binding).
+    let requestSection: Section | undefined
+    if (isBound) {
+      const targetSections = tool.requestFilePath ? await getSections(tool.requestFilePath) : sections
+      requestSection = targetSections.length === 1 ? targetSections[0] : targetSections.find((s) => s.label === tool.requestSectionLabel)
+    } else {
+      requestSection = sections[tool.sectionIndex]
+    }
+    const sectionText = JSON.stringify(requestSection?.blocks ?? [])
 
     // 1. An agent param binds to a {{token}} missing from its own request.
     for (const param of tool.params) {
@@ -277,9 +338,16 @@ async function validateTools(
       }
     }
 
+    // 3b. The tool's own request binding, if set, pointing at a section
+    // that doesn't exist — same check as #3, but for the request this tool
+    // actually runs.
+    if (isBound && !requestSection) {
+      flag(tool, 'dangling-request-reference', `Tool "${tool.name}" is bound to section "${tool.requestSectionLabel}"${tool.requestFilePath ? ` in ${tool.requestFilePath}` : ''}, which doesn't exist.`)
+    }
+
     // 5. Read-only annotation on a request that actually mutates. (4 below, after the loop.)
-    if (tool.annotations?.readOnlyHint && ownSection) {
-      const doc = { type: 'doc' as const, content: ownSection.blocks }
+    if (tool.annotations?.readOnlyHint && requestSection) {
+      const doc = { type: 'doc' as const, content: requestSection.blocks }
       const endpointNode = primitives.findNode(doc, 'api') || primitives.findNode(doc, 'request')
       const method = endpointNode?.content?.find((n: any) => n.type === 'method')?.content?.[0]?.text
       if (method && ['POST', 'PUT', 'PATCH', 'DELETE'].includes(String(method).toUpperCase())) {
@@ -333,6 +401,7 @@ async function runSectionSilently(filePath: string, sectionIndex: number, env: R
     getSchemaAndExtensions(),
   ])
   const { parseMarkdown } = await import(/* @vite-ignore */ '@/core/editors/voiden/markdownConverter')
+  filePath = await resolveCrossFilePath(filePath)
   const content = await (window as any).electron?.files?.read?.(filePath)
   if (content == null) throw new Error(`Could not read file: ${filePath}`)
   const doc = parseMarkdown(content, schema)
@@ -401,7 +470,7 @@ async function verifyTools(
       const target = sections.length === 1 ? sections[0] : sections.find((s) => s.label === entry.sectionLabel)
       if (!target) return { passed: false, error: `Section "${entry.sectionLabel}" not found` }
       try {
-        const response = await runSectionSilently(filePath, target.index, undefined)
+        const response = await runSectionSilently(filePath, target.index, testValueEnv(tool.params))
         return { passed: isPassed(response) }
       } catch (err: any) {
         return { passed: false, error: err?.message ?? String(err) }
@@ -445,6 +514,14 @@ async function verifyTools(
 // ─── Serve-preview decisions (read-only — this app never itself serves an
 // MCP connection; .mcp.json points Claude/Codex at the real server) ───────
 
+/** onFailure is per-entry (each verify row decides its own consequence),
+ *  not tool-wide — see toolCapability.ts's matching function for the full
+ *  reasoning. Most conservative failed entry wins. */
+function combinedOnFailure(status: ToolStatus): ToolOnFailure {
+  const failedEntries = status.results.filter((r) => !r.passed).map((r) => r.entry.onFailure || 'withdraw')
+  return failedEntries.some((f) => f === 'withdraw') ? 'withdraw' : 'advertise-degraded'
+}
+
 function decideServing(statuses: ToolStatus[]): ServeDecision[] {
   return statuses.map((status) => {
     const { tool, state } = status
@@ -452,10 +529,10 @@ function decideServing(statuses: ToolStatus[]): ServeDecision[] {
     if (tool.enabled === false) {
       return { tool, status, served: false, disabledManually: true }
     }
-    if (state === 'failing' && tool.onFailure === 'withdraw') {
-      return { tool, status, served: false }
-    }
-    if (state === 'failing' && tool.onFailure === 'advertise-degraded') {
+    if (state === 'failing') {
+      if (combinedOnFailure(status) === 'withdraw') {
+        return { tool, status, served: false }
+      }
       return {
         tool, status, served: true,
         descriptionNote: `⚠ DEGRADED — recent verification failed (${status.note ?? 'see Verify for details'}). `,
@@ -567,5 +644,6 @@ export function createElectronToolCapability(primitives: ElectronToolPrimitives)
     planServedTools: () => planServedTools(primitives),
     setToolEnabled: (tool: ToolDef, enabled: boolean) => setToolEnabled(tool, enabled),
     getFileSections: (filePath: string) => getFileSections(primitives, filePath),
+    getSectionBlocks: (filePath: string, sectionLabel: string) => getSectionBlocks(primitives, filePath, sectionLabel),
   }
 }

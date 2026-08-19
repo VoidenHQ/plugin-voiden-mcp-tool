@@ -7,8 +7,9 @@
  * since the shapes don't match, but keeps the same visual language (border-b
  * divider, hover highlight, text-sm font-mono) plugin tables already use.
  */
-import React, { useRef } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { FolderOpen, X } from "lucide-react";
+import { useToolCapabilityProvider } from "@/core/tools/toolCapabilityRegistry";
 
 const rowClass = "flex hover:bg-muted/50 transition-colors border-b border-border";
 const headerRowClass = "flex border-b border-border bg-panel text-xs text-comment uppercase tracking-wide font-medium";
@@ -118,14 +119,35 @@ export function TextCell({
 }
 
 /** A file field backed by the native OS file picker instead of a typed path
- *  — used for toolverifies' optional cross-file `filePath`. Stores whatever
- *  absolute path the dialog returns, same as every other file path this
- *  system already reads directly (tool.filePath itself is absolute, from
- *  getVoidFiles()) — no relative-path resolution exists for this field
- *  anywhere downstream, so this intentionally doesn't introduce one. */
+ *  — used for toolverifies' optional cross-file `filePath`. The OS dialog
+ *  always returns an absolute path, but that's not what gets stored: it's
+ *  saved relative to the project root that actually OWNS the file this
+ *  block itself lives in (falling back to absolute only when there's no
+ *  project root to be relative to, or the picked file lives outside it) so
+ *  the reference survives being cloned to a different machine — a cloud VM,
+ *  a teammate's laptop — where the original absolute path is meaningless.
+ *  Whatever's stored here resolves back to absolute wherever it's actually
+ *  read: toolCapabilityElectron.ts in-app, resolvePath() in the headless
+ *  CI/cloud path (toolCapability.ts) — both resolve against the SAME
+ *  project root (the block's own file's), so this has to match. Absolute
+ *  paths saved before this fix still work unchanged — resolution is a
+ *  no-op on them.
+ *
+ *  `directories.getActive()` (the sidebar's currently-selected project) is
+ *  deliberately NOT the primary source for that root: nothing requires the
+ *  file this block lives in to belong to whatever project happens to be
+ *  active, and it may not even be a "known" open directory at all (e.g.
+ *  opened standalone via File > Open, not as part of an opened project
+ *  folder) — using it produced a silent, wrong project root, and thus a
+ *  "starts with .." relative path that always fell back to absolute.
+ *  `ownFilePath` (this block's own containing file, passed down from the
+ *  node view) is walked upward looking for the nearest `.voiden` marker —
+ *  the actual owning project, independent of sidebar selection — and only
+ *  falls back to getActive() when that's unavailable (e.g. an unsaved,
+ *  never-written-to-disk document with no path yet). */
 export function FilePickerCell({
-  value, onChange, disabled, grow, width, placeholder,
-}: { value: string; onChange: (v: string) => void; disabled?: boolean; grow?: boolean; width?: number; placeholder?: string }) {
+  value, onChange, disabled, grow, width, placeholder, ownFilePath,
+}: { value: string; onChange: (v: string) => void; disabled?: boolean; grow?: boolean; width?: number; placeholder?: string; ownFilePath?: string }) {
   const displayName = value ? value.split(/[\\/]/).pop() : "";
 
   const pick = async () => {
@@ -135,7 +157,22 @@ export function FilePickerCell({
         properties: ["openFile"],
         filters: [{ name: "Voiden files", extensions: ["void"] }],
       })) ?? [];
-    if (paths.length > 0) onChange(paths[0]);
+    if (paths.length === 0) return;
+    const absolute = paths[0];
+    const projectRoot: string | null =
+      (ownFilePath ? await (window as any).electron?.path?.findProjectRoot?.(ownFilePath) : null) ??
+      (await (window as any).electron?.directories?.getActive?.());
+    if (!projectRoot) {
+      onChange(absolute);
+      return;
+    }
+    const relative: string | undefined = await (window as any).electron?.path?.toRelative?.(projectRoot, absolute);
+    // A relative path starting with ".." means the file is outside the
+    // project root — still technically resolvable, but not "portable" in
+    // any meaningful sense (it depends on directory structure above the
+    // project on this specific machine), so keep the absolute path instead
+    // of storing something misleadingly relative-looking.
+    onChange(relative && !relative.startsWith("..") ? relative : absolute);
   };
 
   return (
@@ -218,6 +255,95 @@ export function RowShell({ children, onRemove, disabled }: { children: React.Rea
         <X size={12} />
       </button>
     </div>
+  );
+}
+
+// ─── Section picking — shared between toolverifies rows and the tool
+// node's own request-binding field (Pending #3), both need "pick a real
+// section of a file, not a typed guess". ────────────────────────────────
+
+// The dropdown's "nothing chosen yet" placeholder needs its own sentinel
+// value distinct from "" — "" is a legitimate, real choice (it's what gets
+// saved for a file's unlabeled first section, matching what
+// @voiden/executors' parseVoidFileSections() — the real headless engine —
+// treats that section's label as). A plain empty-string placeholder would
+// be indistinguishable from that real choice in an HTML <select>, so a
+// not-yet-picked field starts on this sentinel rather than "".
+export const UNSET_SECTION = "__unset__";
+
+/** Human-readable label for a section value in the dropdown — "" (the real,
+ *  headless-compatible value for an unlabeled first section) reads as a
+ *  blank option otherwise. */
+export function displaySectionLabel(label: string): string {
+  return label === "" ? "(unlabeled — first section)" : label;
+}
+
+/** Section labels of the LIVE editor's own doc — same-file case, no I/O
+ *  needed. Matches toolCapabilityElectron.ts's splitIntoSections() labeling
+ *  convention exactly — first section is "" unless a leading
+ *  request-separator sets a custom label, same as the real headless engine. */
+export function getSameFileSections(editor: any): { index: number; label: string }[] {
+  const doc = editor?.state?.doc;
+  const sections: { index: number; label: string }[] = [{ index: 0, label: "" }];
+  if (!doc) return sections;
+  doc.forEach((node: any) => {
+    if (node.type?.name === "request-separator") {
+      sections.push({ index: sections.length, label: node.attrs?.label || `Request ${sections.length + 1}` });
+    }
+  });
+  return sections;
+}
+
+/** A dropdown of a file's REAL sections instead of a free-typed label — the
+ *  same-file case reads the live editor doc directly (sync, no I/O); a
+ *  cross-file pick (via FilePickerCell) fetches the target file's sections
+ *  through the registered tool-capability provider. Either way, a picked
+ *  value is guaranteed to actually exist, unlike a typed guess. */
+export function SectionLabelCell({
+  value, onChange, editor, filePath, disabled, grow = true,
+}: { value: string; onChange: (v: string) => void; editor: any; filePath: string; disabled?: boolean; grow?: boolean }) {
+  const provider = useToolCapabilityProvider();
+  const [remoteSections, setRemoteSections] = useState<{ index: number; label: string }[] | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!filePath) {
+      setRemoteSections(null);
+      return;
+    }
+    if (!provider) return;
+    setLoading(true);
+    provider
+      .getFileSections(filePath)
+      .then((sections) => { if (!cancelled) setRemoteSections(sections); })
+      .catch(() => { if (!cancelled) setRemoteSections([]); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [filePath, provider]);
+
+  const sections = filePath ? (remoteSections ?? []) : getSameFileSections(editor);
+  const known = new Set(sections.map((s) => s.label));
+  const placeholder = filePath && loading ? "Loading sections…" : "Select a section…";
+
+  const options = [
+    { value: UNSET_SECTION, label: placeholder },
+    // Keeps an already-saved value selectable even if it's not (yet, or no
+    // longer) among the discovered sections — e.g. sections haven't loaded
+    // yet, or the file changed since this row was set up. Never silently
+    // blanks out a saved value.
+    ...(value !== UNSET_SECTION && !known.has(value) ? [{ value, label: `${value} (not found)` }] : []),
+    ...sections.map((s) => ({ value: s.label, label: displaySectionLabel(s.label) })),
+  ];
+
+  return (
+    <SelectCell
+      grow={grow}
+      value={value}
+      onChange={onChange}
+      options={options}
+      disabled={disabled || (!!filePath && loading)}
+    />
   );
 }
 

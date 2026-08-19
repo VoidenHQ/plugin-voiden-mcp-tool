@@ -1,6 +1,6 @@
 {
   "name": "@voiden/plugin-voiden-mcp-tool",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "private": false,
   "description": "Tool declaration block for .void files — mark an existing request as a named, typed capability an AI agent can call directly.",
