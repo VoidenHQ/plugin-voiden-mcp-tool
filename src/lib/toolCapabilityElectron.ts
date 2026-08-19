@@ -147,23 +147,30 @@ async function getSchemaAndExtensions() {
 }
 
 /** Cross-file references (tool.requestFilePath, a verify entry's filePath)
- *  are saved relative to the project root (see Row.tsx's FilePickerCell) so
- *  they survive being cloned to a different machine — resolve back to
- *  absolute here, at the point of actually reading the file. A no-op for
- *  paths already absolute (pre-fix saves, or tool.filePath itself, which
- *  always comes from getVoidFiles() and is never relative), so this is safe
- *  to apply unconditionally at every read site. Mirrors resolvePath() in
+ *  are saved relative to the project that owns the referencing file itself
+ *  (see Row.tsx's FilePickerCell) so they survive being cloned to a
+ *  different machine — resolve back to absolute here, at the point of
+ *  actually reading the file. Resolves against `ownFilePath`'s own project
+ *  (walking up from it looking for the nearest .voiden marker) first, NOT
+ *  directories.getActive() — the sidebar's currently-selected project has
+ *  no guaranteed relationship to the file this reference actually lives in,
+ *  same bug FilePickerCell had on the write side. Falls back to
+ *  getActive() only when `ownFilePath` is unavailable, then to the raw
+ *  filePath if neither resolves anything (matches pre-fix behavior for
+ *  already-absolute paths, always a no-op here). Mirrors resolvePath() in
  *  toolCapability.ts, the headless/CI counterpart of this same problem. */
-async function resolveCrossFilePath(filePath: string): Promise<string> {
+async function resolveCrossFilePath(filePath: string, ownFilePath?: string): Promise<string> {
   const electron = (window as any).electron
-  const projectRoot: string | null = await electron?.directories?.getActive?.()
+  const projectRoot: string | null =
+    (ownFilePath ? await electron?.path?.findProjectRoot?.(ownFilePath) : null) ??
+    (await electron?.directories?.getActive?.())
   if (!projectRoot) return filePath
   return (await electron?.path?.toAbsolute?.(projectRoot, filePath)) ?? filePath
 }
 
-async function parseFile(primitives: ElectronToolPrimitives, filePath: string, schema: any) {
+async function parseFile(primitives: ElectronToolPrimitives, filePath: string, schema: any, ownFilePath?: string) {
   const { parseMarkdown } = await import(/* @vite-ignore */ '@/core/editors/voiden/markdownConverter')
-  const content = await primitives.readFile(await resolveCrossFilePath(filePath))
+  const content = await primitives.readFile(await resolveCrossFilePath(filePath, ownFilePath))
   return parseMarkdown(content ?? '', schema)
 }
 
@@ -172,9 +179,9 @@ async function parseFile(primitives: ElectronToolPrimitives, filePath: string, s
  *  actually exists instead of typed/guessed. Same splitIntoSections()
  *  convention used everywhere else in this file, so a label picked here is
  *  guaranteed to validate. */
-async function getFileSections(primitives: ElectronToolPrimitives, filePath: string): Promise<{ index: number; label: string }[]> {
+async function getFileSections(primitives: ElectronToolPrimitives, filePath: string, ownFilePath?: string): Promise<{ index: number; label: string }[]> {
   const { schema } = await getSchemaAndExtensions()
-  const doc = await parseFile(primitives, filePath, schema)
+  const doc = await parseFile(primitives, filePath, schema, ownFilePath)
   return splitIntoSections(doc).map((s) => ({ index: s.index, label: s.label }))
 }
 
@@ -187,9 +194,9 @@ async function getFileSections(primitives: ElectronToolPrimitives, filePath: str
  *  present". Returns null when the file has multiple sections and none
  *  matches — same "doesn't exist" case the dangling-request-reference
  *  validation check already reports separately. */
-async function getSectionBlocks(primitives: ElectronToolPrimitives, filePath: string, sectionLabel: string): Promise<any[] | null> {
+async function getSectionBlocks(primitives: ElectronToolPrimitives, filePath: string, sectionLabel: string, ownFilePath?: string): Promise<any[] | null> {
   const { schema } = await getSchemaAndExtensions()
-  const doc = await parseFile(primitives, filePath, schema)
+  const doc = await parseFile(primitives, filePath, schema, ownFilePath)
   const sections = splitIntoSections(doc)
   const section = sections.length === 1 ? sections[0] : sections.find((s) => s.label === sectionLabel)
   return section ? section.blocks : null
@@ -643,7 +650,7 @@ export function createElectronToolCapability(primitives: ElectronToolPrimitives)
     verifyTools: (tools: ToolDef[], opts?: { cadence?: string }) => verifyTools(primitives, tools, opts),
     planServedTools: () => planServedTools(primitives),
     setToolEnabled: (tool: ToolDef, enabled: boolean) => setToolEnabled(tool, enabled),
-    getFileSections: (filePath: string) => getFileSections(primitives, filePath),
-    getSectionBlocks: (filePath: string, sectionLabel: string) => getSectionBlocks(primitives, filePath, sectionLabel),
+    getFileSections: (filePath: string, ownFilePath?: string) => getFileSections(primitives, filePath, ownFilePath),
+    getSectionBlocks: (filePath: string, sectionLabel: string, ownFilePath?: string) => getSectionBlocks(primitives, filePath, sectionLabel, ownFilePath),
   }
 }

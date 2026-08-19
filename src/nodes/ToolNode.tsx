@@ -154,7 +154,7 @@ export const createToolNode = (NodeViewWrapper: any, RequestBlockHeader: any) =>
           // Cross-file — that file may not be open in any editor tab, so
           // this goes through the tool-capability provider (reads from
           // disk) instead of a live editor doc.
-          blocks = provider ? await provider.getSectionBlocks(requestFilePath, requestSectionLabel) : null;
+          blocks = provider ? await provider.getSectionBlocks(requestFilePath, requestSectionLabel, props.editor?.storage?.source) : null;
         } else if (isBound) {
           // Bound to a different section of THIS SAME file — no I/O
           // needed, read straight from the live editor doc by label.

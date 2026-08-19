@@ -1,5 +1,15 @@
 [
   {
+    "version": "v0.2.1",
+    "date": "19/08/2026",
+    "title": "Fix: Cross-File References Still Resolved Against the Wrong Project",
+    "changes": {
+      "Fixed": [
+        "The v0.2.0 fix only covered saving a cross-file reference (the /tool block's \"attach a request\" picker, a verify row's file override) as a path relative to the file's own project — reading it back (\"Auto-populate params\", the verify row's section-label dropdown) still resolved that relative path against whatever project was globally active in the sidebar, not the file's own. When those differ, this silently read the wrong file (or nothing) instead of the intended one — most visibly as a false \"No {{placeholders}} found in that request — nothing to add\" on Auto-populate. Both the save and read paths now resolve against the same project root: the one that actually owns the file the reference lives in"
+      ]
+    }
+  },
+  {
     "version": "v0.2.0",
     "date": "19/08/2026",
     "title": "Per-Request Verification Policy & Portable File References",
