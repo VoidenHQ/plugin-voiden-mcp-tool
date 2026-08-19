@@ -24,7 +24,7 @@
 
 import { readFileSync, writeFileSync } from 'fs'
 import { execSync } from 'node:child_process'
-import { join } from 'node:path'
+import { join, isAbsolute } from 'node:path'
 import YAML from 'yaml'
 import { z } from 'zod'
 import type { ZodTypeAny } from 'zod'
@@ -60,8 +60,11 @@ export interface ToolExtraction {
   requestUid?: string
   params: ToolParamDef[]
   verifies: ToolVerifyEntry[]
-  onFailure: ToolOnFailure
   enabled: boolean
+  /** See toolBlocks.ts's ToolBlockConfig — absent means "not bound, use the
+   *  sibling request in this tool's own section" (the original behavior). */
+  requestFilePath?: string
+  requestSectionLabel?: string
 }
 
 export interface ToolDef extends ToolExtraction {
@@ -85,8 +88,45 @@ interface ToolStatus {
 
 interface ToolValidationIssue {
   tool: ToolDef
-  check: 'unbound-param' | 'unresolved-placeholder' | 'missing-section' | 'duplicate-name' | 'readonly-mutating'
+  check: 'unbound-param' | 'unresolved-placeholder' | 'missing-section' | 'duplicate-name' | 'readonly-mutating' | 'dangling-request-reference'
   message: string
+}
+
+/** A cross-file requestFilePath / verify-entry filePath resolves relative to
+ *  the PROJECT ROOT — not process.cwd() (unreliable; depends on wherever the
+ *  CLI happens to be invoked from) and not the referencing file's own
+ *  directory (would make an already-non-obvious cross-file reference even
+ *  harder to reason about). Absolute paths pass through unchanged, so this
+ *  stays backward compatible with every file already authored — the file
+ *  picker (Row.tsx's FilePickerCell) has only ever saved whatever absolute
+ *  path the OS dialog returns, which is exactly why a project moved to a
+ *  different machine (a teammate's laptop, a CI runner, a cloud deploy)
+ *  currently breaks every cross-file /tool reference outright: an absolute
+ *  path baked in on the machine that authored it can't exist anywhere else.
+ *  A relative path (hand-edited today; from a future picker fix tomorrow)
+ *  survives that move correctly. `projectRoot` is technically optional on
+ *  VerifyToolsOptions (matching the shared type) even though every real
+ *  caller always passes it — a relative path with no projectRoot available
+ *  is returned unresolved rather than thrown on, the same as today's
+ *  (unresolved) behavior, not a new failure mode. */
+function resolvePath(filePath: string, projectRoot: string | undefined): string {
+  if (isAbsolute(filePath) || !projectRoot) return filePath
+  return join(projectRoot, filePath)
+}
+
+/** Where THIS tool's own request actually lives — the sibling in its own
+ *  section by default, or wherever requestFilePath/requestSectionLabel
+ *  points once bound (Pending #3 — cross-file/cross-section request
+ *  binding). Distinct from `tool.filePath`/`tool.sectionLabel`, which
+ *  always mean "where the /tool block itself is written" (still correct
+ *  for write-back — upsertToolStatus always edits that file, never the
+ *  bound request's file). */
+function resolveRequestLocation(tool: ToolDef, projectRoot: string): { filePath: string; sectionLabel?: string } {
+  if (tool.requestSectionLabel !== undefined) {
+    const raw = tool.requestFilePath || tool.filePath
+    return { filePath: resolvePath(raw, projectRoot), sectionLabel: tool.requestSectionLabel }
+  }
+  return { filePath: tool.filePath, sectionLabel: tool.sectionLabel }
 }
 
 interface ServeDecision {
@@ -101,11 +141,30 @@ interface ServeDecision {
   disabledManually?: boolean
 }
 
+/** One verify entry's last-known result, cached across scheduler ticks
+ *  (owned/persisted by the caller — @voiden/mcp's scheduler) so each entry
+ *  is only actually re-run when its own declared `cadence` says it's due,
+ *  not on one shared interval for the whole server. */
+export interface VerifyEntryCacheRecord {
+  passed: boolean
+  runResult?: any
+  verifiedAt: number
+}
+export type VerifyEntryCache = Map<string, VerifyEntryCacheRecord>
+
 interface VerifyToolsOptions {
   cadence?: string
   env?: Record<string, string>
   runtimeVars?: Record<string, any>
   activePlugins: string[]
+  entryCache?: VerifyEntryCache
+  now?: number
+  /** Resolves a relative entry.filePath/tool.filePath against this — see
+   *  resolvePath()'s own doc comment. Omitting it (nothing currently does)
+   *  would leave a relative path resolving against process.cwd() instead,
+   *  which happens to work by coincidence when the CLI is invoked from the
+   *  project root and nowhere else — always pass this. */
+  projectRoot?: string
 }
 
 interface ToolStatusRecord {
@@ -190,15 +249,41 @@ async function validateTools(
     }
   }
 
-  const getSectionText = async (tool: ToolDef): Promise<string> => {
-    const cacheKey = `${tool.filePath}::${tool.sectionLabel ?? ''}`
-    let text = sectionTextCache.get(cacheKey)
-    if (text === undefined) {
-      const content = readFileSync(tool.filePath, 'utf-8')
-      const section = (await parseVoidFileSections(content)).find((s) => s.label === tool.sectionLabel)
-      text = JSON.stringify(section?.blocks ?? [])
-      sectionTextCache.set(cacheKey, text)
+  // `null` return = the request genuinely couldn't be resolved (its file
+  // doesn't exist, or reading it failed some other way) — distinct from a
+  // real, empty/no-match section (""), which is a normal, valid state. The
+  // caller uses this to skip checks 1/2 entirely rather than run them
+  // against phantom empty text, leaving the dangling-request-reference
+  // check (3b, below) as the one place that actually reports this — one
+  // clear message per broken tool, not a confusing pile of unrelated
+  // "unbound-param" errors caused by the same missing file.
+  const getSectionText = async (tool: ToolDef): Promise<string | null> => {
+    const { filePath, sectionLabel } = resolveRequestLocation(tool, projectRoot)
+    const cacheKey = `${filePath}::${sectionLabel ?? ''}`
+    if (sectionTextCache.has(cacheKey)) return sectionTextCache.get(cacheKey)!
+
+    let text: string | null
+    try {
+      const content = readFileSync(filePath, 'utf-8')
+      const sections = await parseVoidFileSections(content)
+      // Same single-section leniency the missing-section/dangling-request-
+      // reference checks below already apply (via singleSectionFiles) —
+      // parseVoidFileSections() leaves a file's unlabeled first section's
+      // `label` as `undefined` (not `""`), so a tool storing
+      // requestSectionLabel: "" (the normal case for an unbound, single-
+      // request file) would otherwise never strictly-equal-match it here,
+      // silently resolving to an empty section — and from there, a false
+      // "doesn't appear anywhere in the request" on every param, no matter
+      // how correct the request actually is.
+      const section = sections.length === 1 ? sections[0] : sections.find((s) => s.label === sectionLabel)
+      text = section ? JSON.stringify(section.blocks) : null
+    } catch {
+      // readFileSync throws (ENOENT — requestFilePath points at a file that
+      // doesn't exist, or isn't readable) — a real, expected authoring
+      // mistake (a moved/renamed/deleted file), not a crash-worthy one.
+      text = null
     }
+    sectionTextCache.set(cacheKey, text)
     return text
   }
 
@@ -211,39 +296,64 @@ async function validateTools(
     const sectionText = await getSectionText(tool)
 
     // 1. An agent param binds to a {{token}} missing from its own request.
+    // Skipped entirely when the request itself couldn't be resolved (null)
+    // — 3b below reports that case on its own, once, clearly.
     for (const param of tool.params) {
       if (!param.binds) continue
-      if (!sectionText.includes(`{{${param.binds}}}`)) {
+      if (sectionText !== null && !sectionText.includes(`{{${param.binds}}}`)) {
         flag(tool, 'unbound-param', `Tool "${tool.name}" param "${param.name}" binds to "{{${param.binds}}}", which doesn't appear anywhere in the request it decorates.`)
       }
     }
 
     // 2. The reverse: a {{token}} in the request that no param declares.
-    const declaredBinds = new Set(tool.params.map((p) => p.binds).filter(Boolean))
-    for (const token of extractPlaceholders(sectionText)) {
-      if (!declaredBinds.has(token)) {
-        flag(tool, 'unresolved-placeholder', `Tool "${tool.name}" request uses "{{${token}}}", which isn't declared as any parameter's "binds" — it can only resolve if it happens to be a real environment variable outside Voiden's knowledge.`)
+    // Same null-skip as #1 — nothing meaningful to extract placeholders
+    // from when the request itself couldn't be resolved.
+    if (sectionText !== null) {
+      const declaredBinds = new Set(tool.params.map((p) => p.binds).filter(Boolean))
+      for (const token of extractPlaceholders(sectionText)) {
+        if (!declaredBinds.has(token)) {
+          flag(tool, 'unresolved-placeholder', `Tool "${tool.name}" request uses "{{${token}}}", which isn't declared as any parameter's "binds" — it can only resolve if it happens to be a real environment variable outside Voiden's knowledge.`)
+        }
       }
     }
 
     // 3. A verifies entry pointing at a section that doesn't exist.
     for (const entry of tool.verifies) {
-      const targetPath = entry.filePath || tool.filePath
+      const targetPath = resolvePath(entry.filePath || tool.filePath, projectRoot)
       const key = `${targetPath}::${entry.sectionLabel}`
       if (!singleSectionFiles.has(targetPath) && !sectionIndex.has(key)) {
         flag(tool, 'missing-section', `Tool "${tool.name}" verifies entry points at section "${entry.sectionLabel}"${entry.filePath ? ` in ${entry.filePath}` : ''}, which doesn't exist.`)
       }
     }
 
+    // 3b. The tool's own request binding (Pending #3), if set, pointing at a
+    // section that doesn't exist — same check as #3, but for the request
+    // this tool actually runs, not a verification request.
+    if (tool.requestSectionLabel !== undefined) {
+      const { filePath: targetPath, sectionLabel } = resolveRequestLocation(tool, projectRoot)
+      const key = `${targetPath}::${sectionLabel}`
+      if (!singleSectionFiles.has(targetPath) && !sectionIndex.has(key)) {
+        flag(tool, 'dangling-request-reference', `Tool "${tool.name}" is bound to section "${sectionLabel}"${tool.requestFilePath ? ` in ${tool.requestFilePath}` : ''}, which doesn't exist.`)
+      }
+    }
+
     // 5. Read-only annotation on a request that actually mutates. (4 below, after the loop.)
+    // Same dangling-reference risk as #1/#2 (a moved/renamed/deleted
+    // requestFilePath) — guarded the same way; 3b above already reports
+    // that case on its own, this one just has nothing left to check here.
     if (tool.annotations?.readOnlyHint) {
-      const content = readFileSync(tool.filePath, 'utf-8')
-      const section = (await parseVoidFileSections(content)).find((s) => s.label === tool.sectionLabel)
-      if (section) {
-        const { method } = primitives.getRequestPreview(section.blocks)
-        if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(method.toUpperCase())) {
-          flag(tool, 'readonly-mutating', `Tool "${tool.name}" is annotated readOnlyHint but its request uses ${method.toUpperCase()}.`)
+      const { filePath: reqFilePath, sectionLabel: reqSectionLabel } = resolveRequestLocation(tool, projectRoot)
+      try {
+        const content = readFileSync(reqFilePath, 'utf-8')
+        const section = (await parseVoidFileSections(content)).find((s) => s.label === reqSectionLabel)
+        if (section) {
+          const { method } = primitives.getRequestPreview(section.blocks)
+          if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(method.toUpperCase())) {
+            flag(tool, 'readonly-mutating', `Tool "${tool.name}" is annotated readOnlyHint but its request uses ${method.toUpperCase()}.`)
+          }
         }
+      } catch {
+        // Unreadable/missing file — nothing to check; 3b already flags this tool.
       }
     }
   }
@@ -277,6 +387,39 @@ function isAssertionPassed(result: any): boolean {
   return result.success === true
 }
 
+const CADENCE_MINUTES: Record<string, number> = {
+  hourly: 60,
+  daily: 60 * 24,
+  weekly: 60 * 24 * 7,
+  monthly: 60 * 24 * 30,
+}
+/** An entry with no cadence (or an unrecognized one — not yet an enum in
+ *  the block schema, see Pending #1's own note) falls back to this — the
+ *  same default the old shared-interval scheduler used, so "no cadence
+ *  declared" behaves the same as it always has. */
+const DEFAULT_CADENCE_MINUTES = 60
+
+function cadenceMinutes(cadence: string | undefined): number {
+  if (!cadence) return DEFAULT_CADENCE_MINUTES
+  return CADENCE_MINUTES[cadence.trim().toLowerCase()] ?? DEFAULT_CADENCE_MINUTES
+}
+
+/** Every param is agent-supplied at call time (see ToolParamDef), so there's
+ *  no agent present to fill one in during verification — this substitutes
+ *  each param's own `testValue` instead, the same way an actual agent call
+ *  would substitute its args, keyed by `binds` so it lands in the request
+ *  the same way. A param with no testValue contributes nothing here; its
+ *  {{token}} stays unresolved, and the request correctly fails on it —
+ *  honest signal that this param needs a testValue to be verifiable, not a
+ *  gap to paper over. */
+function testValueEnv(params: ToolParamDef[]): Record<string, string> {
+  const env: Record<string, string> = {}
+  for (const p of params) {
+    if (p.testValue !== undefined && p.testValue !== '') env[p.binds] = p.testValue
+  }
+  return env
+}
+
 async function verifyTools(
   primitives: RunnerPrimitives,
   tools: ToolDef[],
@@ -306,24 +449,57 @@ async function verifyTools(
     const others = runnable.filter((e) => e.role !== 'auth-check')
     const runtimeVars = opts.runtimeVars ?? {}
     const results: ToolVerifyResult[] = []
+    const now = opts.now ?? Date.now()
+    const cache = opts.entryCache
 
     const runEntry = async (entry: ToolVerifyEntry) => {
-      const filePath = entry.filePath || tool.filePath
+      const filePath = resolvePath(entry.filePath || tool.filePath, opts.projectRoot)
       const run = await primitives.runVoidFile(filePath, {
         sectionLabel: entry.sectionLabel,
-        env: opts.env,
+        // testValueEnv wins over opts.env for a param's own binds key —
+        // it's the tool author's explicit stand-in for this exact param,
+        // taking precedence over whatever the same name might otherwise
+        // resolve to as a generic project env var.
+        env: { ...opts.env, ...testValueEnv(tool.params) },
         runtimeVars,
         activePlugins: opts.activePlugins,
       })
       return run.results[0]?.result
     }
 
+    // Per-entry cadence: each verify row is only actually re-run when its
+    // OWN declared cadence says it's due (falling back to `cache.get(key)`
+    // otherwise) — not one shared interval for every entry on the tool,
+    // let alone the whole server. `entryIndex` (not the entry object
+    // itself) is what makes the key stable across the fresh `ToolDef[]`
+    // every planServedTools() call re-discovers.
+    const resolveEntry = async (entry: ToolVerifyEntry, entryIndex: number): Promise<{ passed: boolean; runResult: any }> => {
+      const key = `${tool.toolBlockUid}::${entryIndex}`
+      if (cache) {
+        const cached = cache.get(key)
+        if (cached && now - cached.verifiedAt < cadenceMinutes(entry.cadence) * 60_000) {
+          return { passed: cached.passed, runResult: cached.runResult }
+        }
+      }
+      const runResult = await runEntry(entry)
+      const passed = runResult ? isAssertionPassed(runResult) : false
+      if (cache) cache.set(key, { passed, runResult, verifiedAt: now })
+      // Logged only for an entry actually just run (cache hits above return
+      // early, before this point) — one line per real verification, not one
+      // per cache-hit no-op, so a live server's log genuinely reflects "this
+      // network call just happened" rather than spamming every tick for
+      // entries that were never due.
+      console.error(
+        `  ${passed ? '✓' : '✗'}  verify "${tool.name}" [${entry.role}${entry.cadence ? `, cadence: ${entry.cadence}` : ''}] — ${passed ? 'passed' : `failed${runResult?.error ? `: ${runResult.error}` : ''}`}`
+      )
+      return { passed, runResult }
+    }
+
     let authFailed = false
     let note: string | undefined
 
     for (const entry of authChecks) {
-      const runResult = await runEntry(entry)
-      const passed = runResult ? isAssertionPassed(runResult) : false
+      const { passed, runResult } = await resolveEntry(entry, tool.verifies.indexOf(entry))
       results.push({ entry, passed, reason: passed ? undefined : 'auth-failure', runResult })
       if (!passed) {
         authFailed = true
@@ -338,8 +514,7 @@ async function verifyTools(
 
     let anyContractFailed = false
     for (const entry of others) {
-      const runResult = await runEntry(entry)
-      const passed = runResult ? isAssertionPassed(runResult) : false
+      const { passed, runResult } = await resolveEntry(entry, tool.verifies.indexOf(entry))
       if (!passed) anyContractFailed = true
       results.push({ entry, passed, reason: passed ? undefined : 'contract-failure', runResult })
     }
@@ -356,6 +531,17 @@ async function verifyTools(
 
 // ─── Serving decisions ──────────────────────────────────────────────────────
 
+/** onFailure is per-entry (each verify row decides its own consequence),
+ *  not tool-wide — so when the tool is 'failing', the applicable policy
+ *  comes from whichever entries actually failed, not a single setting.
+ *  When failed entries disagree, the most conservative one wins: any
+ *  'withdraw' among them withdraws the whole tool; only if EVERY failed
+ *  entry says 'advertise-degraded' is it served degraded. */
+function combinedOnFailure(status: ToolStatus): ToolOnFailure {
+  const failedEntries = status.results.filter((r) => !r.passed).map((r) => r.entry.onFailure || 'withdraw')
+  return failedEntries.some((f) => f === 'withdraw') ? 'withdraw' : 'advertise-degraded'
+}
+
 function decideServing(statuses: ToolStatus[]): ServeDecision[] {
   return statuses.map((status) => {
     const { tool, state } = status
@@ -365,10 +551,10 @@ function decideServing(statuses: ToolStatus[]): ServeDecision[] {
     if (tool.enabled === false) {
       return { tool, status, served: false, disabledManually: true }
     }
-    if (state === 'failing' && tool.onFailure === 'withdraw') {
-      return { tool, status, served: false }
-    }
-    if (state === 'failing' && tool.onFailure === 'advertise-degraded') {
+    if (state === 'failing') {
+      if (combinedOnFailure(status) === 'withdraw') {
+        return { tool, status, served: false }
+      }
       return {
         tool, status, served: true,
         descriptionNote: `⚠ DEGRADED — recent verification failed (${status.note ?? 'see voiden-runner tool verify for details'}). `,
@@ -397,6 +583,7 @@ async function planServedTools(
   projectRoot: string,
   env: Record<string, string>,
   activePlugins: string[],
+  opts?: { entryCache?: VerifyEntryCache; now?: number },
 ): Promise<ServeDecision[]> {
   const tools = await discoverTools(primitives, extractFn, projectRoot, { activePlugins })
   const { validTools, issues } = await validateTools(primitives, projectRoot, tools)
@@ -412,7 +599,7 @@ async function planServedTools(
   // Preview Serve panel never had this gap, since it verifies through the
   // editor's live active-environment pipeline instead of a bare process env.
   const resolvedEnv: Record<string, string> = { ...loadProjectEnvironmentVars(projectRoot), ...env }
-  const statuses = await verifyTools(primitives, validTools, { env: resolvedEnv, activePlugins })
+  const statuses = await verifyTools(primitives, validTools, { env: resolvedEnv, activePlugins, entryCache: opts?.entryCache, now: opts?.now, projectRoot })
   return [...decideExcluded(issues), ...decideServing(statuses)]
 }
 
@@ -426,8 +613,8 @@ async function planServedTools(
  *  app resolves that from a per-project UI selection persisted in its own
  *  state; there's no interactive session to select one from here). A
  *  project with zero or more than one environment is ambiguous — returns
- *  {} rather than guessing which one a `source: environment` param should
- *  resolve from. */
+ *  {} rather than guessing which one an unbound {{ENV_VAR}} in a request
+ *  should resolve from. */
 function loadProjectEnvironmentVars(projectRoot: string): Record<string, string> {
   const readTree = (relPath: string): Record<string, { variables?: Record<string, string> }> => {
     try {
@@ -463,13 +650,11 @@ function zodForParam(p: ToolParamDef): ZodTypeAny {
   return p.required ? described : described.optional()
 }
 
-// Only agent-sourced params become part of the tool's callable inputSchema —
-// environment-sourced ones never appear here, so the agent can't see or
-// supply them even if it wanted to. They resolve from the server process's
-// own env at call time instead (see buildToolHandler).
+// Every declared param is agent-facing — becomes part of the tool's callable
+// inputSchema. A {{token}} that should resolve from the environment instead
+// just doesn't get a param row at all (see ToolParamDef's own doc comment).
 function buildInputSchema(tool: ToolDef): Record<string, ZodTypeAny> {
-  const agentParams = tool.params.filter((p) => p.source === 'agent')
-  return Object.fromEntries(agentParams.map((p) => [p.name, zodForParam(p)]))
+  return Object.fromEntries(tool.params.map((p) => [p.name, zodForParam(p)]))
 }
 
 function buildToolHandler(
@@ -478,40 +663,39 @@ function buildToolHandler(
   baseEnv: Record<string, string>,
   runtimeVars: Record<string, any>,
   activePlugins: string[],
+  projectRoot: string,
 ) {
   return async (agentArgs: Record<string, any>) => {
     const env: Record<string, string> = { ...baseEnv }
     for (const p of tool.params) {
-      if (p.source === 'agent' && agentArgs[p.name] !== undefined) {
+      if (agentArgs[p.name] !== undefined) {
         env[p.binds] = typeof agentArgs[p.name] === 'string' ? agentArgs[p.name] : JSON.stringify(agentArgs[p.name])
       }
-      // source === 'environment': deliberately left untouched — resolves from
-      // baseEnv, which by this point already has the project's env-file
-      // variables merged in (see registerServedTools) alongside the server
-      // process's own env, exactly like every other {{...}} placeholder in
-      // the request that isn't tool-param-bound. Never sourced from agentArgs.
     }
-    const run = await primitives.runVoidFile(tool.filePath, { sectionLabel: tool.sectionLabel, env, runtimeVars, activePlugins })
+    const { filePath, sectionLabel } = resolveRequestLocation(tool, projectRoot)
+    const run = await primitives.runVoidFile(filePath, { sectionLabel, env, runtimeVars, activePlugins })
     return { content: [{ type: 'text' as const, text: JSON.stringify(run.results[0]?.result, null, 2) }] }
   }
 }
 
-function registerServedTools(
+/** Plain-JSON version of a param's schema for search_tools' listing — not a
+ *  real Zod object (that's only meaningful to server.registerTool's own
+ *  inputSchema, which call_tool's single, fixed inputSchema doesn't use per
+ *  served tool), just enough for an agent to know what to pass. */
+function describeParams(tool: ToolDef): Array<{ name: string; type: string; required: boolean; description?: string }> {
+  return tool.params.map((p) => ({ name: p.name, type: p.type, required: p.required, description: p.description }))
+}
+
+function registerStaticTools(
   primitives: RunnerPrimitives,
   server: McpServer,
   decisions: ServeDecision[],
-  baseEnv: Record<string, string>,
+  env: Record<string, string>,
   runtimeVars: Record<string, any>,
   activePlugins: string[],
   commitSha: string | undefined,
   projectRoot: string,
 ): void {
-  // Computed once for the whole server process, not per-call — the project's
-  // env files don't change mid-session. Project vars come first so an
-  // explicit override on the server process's own env (e.g. set via
-  // .mcp.json's "env" block) still wins on a collision.
-  const env: Record<string, string> = { ...loadProjectEnvironmentVars(projectRoot), ...baseEnv }
-
   for (const d of decisions) {
     if (!d.served || !d.status) continue
     const { tool, status } = d
@@ -533,8 +717,107 @@ function registerServedTools(
           },
         },
       },
-      buildToolHandler(primitives, tool, env, runtimeVars, activePlugins),
+      buildToolHandler(primitives, tool, env, runtimeVars, activePlugins, projectRoot),
     )
+  }
+}
+
+/** `--mode dynamic` — exactly 2 tools instead of one per served /tool block,
+ *  so a project with hundreds+ of published endpoints doesn't blow up the
+ *  agent's context window with hundreds+ of individually-registered tool
+ *  schemas. search_tools lists what's actually being served (each served
+ *  tool's own name/description/params/verification state — the same
+ *  information static mode would've put directly on the MCP tool listing,
+ *  just returned as data instead); call_tool dispatches to one of them by
+ *  name, reusing the exact same buildToolHandler() static mode itself
+ *  calls — one execution path underneath both modes, just a different
+ *  surface on top. */
+function registerDynamicTools(
+  primitives: RunnerPrimitives,
+  server: McpServer,
+  decisions: ServeDecision[],
+  env: Record<string, string>,
+  runtimeVars: Record<string, any>,
+  activePlugins: string[],
+  commitSha: string | undefined,
+  projectRoot: string,
+): void {
+  const served = new Map<string, { tool: ToolDef; status: ToolStatus; descriptionNote?: string }>()
+  for (const d of decisions) {
+    if (!d.served || !d.status) continue
+    served.set(d.tool.name, { tool: d.tool, status: d.status, descriptionNote: d.descriptionNote })
+  }
+
+  server.registerTool(
+    'search_tools',
+    {
+      title: 'Search Tools',
+      description: 'List every tool this server currently publishes — name, description, parameters, and verification state. Call this first; call_tool needs an exact name from here.',
+      inputSchema: {
+        query: z.string().optional().describe('Optional case-insensitive substring to filter by name/title/description. Omit to list everything.'),
+      },
+    },
+    async ({ query }: { query?: string }) => {
+      const q = query?.trim().toLowerCase()
+      const results = [...served.values()]
+        .filter(({ tool }) => !q || [tool.name, tool.title, tool.description].some((s) => s?.toLowerCase().includes(q)))
+        .map(({ tool, status, descriptionNote }) => ({
+          name: tool.name,
+          title: tool.title,
+          description: (descriptionNote ?? '') + tool.description,
+          params: describeParams(tool),
+          annotations: tool.annotations,
+          verification: { state: status.state, ...(commitSha ? { commit: commitSha } : {}) },
+        }))
+      return { content: [{ type: 'text' as const, text: JSON.stringify(results, null, 2) }] }
+    },
+  )
+
+  server.registerTool(
+    'call_tool',
+    {
+      title: 'Call Tool',
+      description: 'Call one of the tools listed by search_tools, by its exact name.',
+      inputSchema: {
+        name: z.string().describe('A tool name from search_tools\' results.'),
+        arguments: z.record(z.any()).optional().describe('Arguments matching that tool\'s own params (see search_tools).'),
+      },
+    },
+    async ({ name, arguments: args }: { name: string; arguments?: Record<string, any> }) => {
+      const found = served.get(name)
+      if (!found) {
+        return {
+          content: [{ type: 'text' as const, text: `No tool named "${name}" is currently served. Call search_tools to see what's available.` }],
+          isError: true,
+        }
+      }
+      const handler = buildToolHandler(primitives, found.tool, env, runtimeVars, activePlugins, projectRoot)
+      return handler(args ?? {})
+    },
+  )
+}
+
+function registerServedTools(
+  primitives: RunnerPrimitives,
+  server: McpServer,
+  decisions: ServeDecision[],
+  baseEnv: Record<string, string>,
+  runtimeVars: Record<string, any>,
+  activePlugins: string[],
+  commitSha: string | undefined,
+  projectRoot: string,
+  mode: 'static' | 'dynamic' = 'static',
+): void {
+  // Computed once for the whole server process, not per-call — the project's
+  // env files don't change mid-session. Project vars come first so an
+  // explicit override on the server process's own env (e.g. set via
+  // .mcp.json's "env" block) still wins on a collision.
+  const env: Record<string, string> = { ...loadProjectEnvironmentVars(projectRoot), ...baseEnv }
+
+  if (mode === 'dynamic') {
+    registerDynamicTools(primitives, server, decisions, env, runtimeVars, activePlugins, commitSha, projectRoot)
+  } else {
+    registerStaticTools(primitives, server, decisions, env, runtimeVars, activePlugins, commitSha, projectRoot)
   }
 }
 
@@ -631,8 +914,8 @@ export function createToolCapability(primitives: RunnerPrimitives, extractFn: Ex
       validateTools(primitives, projectRoot, tools),
     verifyTools: (tools: ToolDef[], opts: VerifyToolsOptions) =>
       verifyTools(primitives, tools, opts),
-    planServedTools: (projectRoot: string, env: Record<string, string>, activePlugins: string[]) =>
-      planServedTools(primitives, extractFn, projectRoot, env, activePlugins),
+    planServedTools: (projectRoot: string, env: Record<string, string>, activePlugins: string[], opts?: { entryCache?: VerifyEntryCache; now?: number }) =>
+      planServedTools(primitives, extractFn, projectRoot, env, activePlugins, opts),
     registerServedTools: (
       server: McpServer,
       decisions: ServeDecision[],
@@ -641,7 +924,8 @@ export function createToolCapability(primitives: RunnerPrimitives, extractFn: Ex
       activePlugins: string[],
       commitSha: string | undefined,
       projectRoot: string,
-    ) => registerServedTools(primitives, server, decisions, baseEnv, runtimeVars, activePlugins, commitSha, projectRoot),
+      mode?: 'static' | 'dynamic',
+    ) => registerServedTools(primitives, server, decisions, baseEnv, runtimeVars, activePlugins, commitSha, projectRoot, mode),
     upsertToolStatus,
     getCommitSha,
   }

@@ -4,9 +4,13 @@
  * The verification policy: which other requests (by section label, and
  * optionally a different file) prove this tool works, each labeled
  * happy-path/error-contract/auth-check, with a per-entry mode (live/sandbox/
- * none — matches voiden-mcp-blocks-spec.md §1.9's illustrative shape, where
- * only some entries specify a mode). `onFailure` is the one remaining scalar
- * policy attr that applies to the whole tool, not per-entry.
+ * none) and a per-entry onFailure — what happens to the WHOLE tool if THIS
+ * request fails. Per-entry, not a single tool-wide setting, because
+ * different requests can reasonably warrant different consequences (e.g. an
+ * auth-check failing might mean "withdraw", a soft error-contract check
+ * failing might only mean "flag degraded"). When entries disagree, the most
+ * conservative failed one wins — see decideServing() in toolCapability.ts /
+ * toolCapabilityElectron.ts.
  *
  * `sandbox` is a label, not a redirection — Voiden runs it exactly like
  * `live`. It only means "the request this row points at already targets a
@@ -14,11 +18,10 @@
  * what's sandbox vs production, it only calls whatever URL the request has.
  */
 
-import React, { useEffect, useState } from "react";
+import React from "react";
 import { mergeAttributes, Node } from "@tiptap/core";
 import { ReactNodeViewRenderer } from "@tiptap/react";
-import { AddRowButton, FilePickerCell, HeaderRow, RowShell, SelectCell, TextCell } from "../components/Row";
-import { useToolCapabilityProvider } from "@/core/tools/toolCapabilityRegistry";
+import { AddRowButton, FilePickerCell, HeaderRow, RowShell, SectionLabelCell, SelectCell, UNSET_SECTION } from "../components/Row";
 import type { ToolOnFailure, ToolVerifyEntry, ToolVerifyRole, ToolVerifyMode } from "../lib/toolBlocks";
 
 const ROLE_OPTIONS: { value: ToolVerifyRole; label: string }[] = [
@@ -34,107 +37,45 @@ const MODE_OPTIONS: { value: ToolVerifyMode; label: string }[] = [
 ];
 
 const ON_FAILURE_OPTIONS: { value: ToolOnFailure; label: string }[] = [
-  { value: "withdraw", label: "withdraw from agent" },
-  { value: "advertise-degraded", label: "keep, flagged degraded" },
+  { value: "withdraw", label: "withdraw" },
+  { value: "advertise-degraded", label: "degrade" },
 ];
 
-// The dropdown's "nothing chosen yet" placeholder needs its own sentinel
-// value distinct from "" — "" is now a legitimate, real choice (it's what
-// gets saved for a file's unlabeled first section, matching what
-// @voiden/executors' parseVoidFileSections() — the real headless engine —
-// treats that section's label as; see splitIntoSections()'s own doc comment
-// in toolCapabilityElectron.ts). A plain empty-string placeholder would be
-// indistinguishable from that real choice in an HTML <select>, so a new row
-// starts on this sentinel rather than "" — it fails validation (correctly,
-// same as an empty string always did before) until the user actually picks
-// a section.
-const UNSET_SECTION = "__unset__";
+// The only 4 values the scheduler actually recognizes (case-insensitive) —
+// see CADENCE_MINUTES in toolCapability.ts. Anything else, including a typo
+// or a value that looks plausible (the field used to be free text), silently
+// falls back to the 60-minute default with no warning anywhere — a fixed
+// list here is what prevents that instead of just describing it in a
+// placeholder.
+const CADENCE_OPTIONS: { value: string; label: string }[] = [
+  { value: "hourly", label: "hourly" },
+  { value: "daily", label: "daily" },
+  { value: "weekly", label: "weekly" },
+  { value: "monthly", label: "monthly" },
+];
 
-const emptyRow = (): ToolVerifyEntry => ({ filePath: "", sectionLabel: UNSET_SECTION, role: "happy-path", cadence: "", mode: "live" });
-
-/** Human-readable label for a section value in the dropdown — "" (the real,
- *  headless-compatible value for an unlabeled first section) reads as a
- *  blank option otherwise. */
-function displaySectionLabel(label: string): string {
-  return label === "" ? "(unlabeled — first section)" : label;
+/** Appends the row's current value as an extra, clearly-marked option when
+ *  it doesn't match one of the four recognized ones — e.g. a legacy value
+ *  saved before this was a fixed list. Without this the <select> would just
+ *  silently show nothing selected while still reporting (and running) a
+ *  value the scheduler doesn't recognize. */
+function cadenceOptionsFor(value: string | undefined): { value: string; label: string }[] {
+  if (!value || CADENCE_OPTIONS.some((o) => o.value === value)) return CADENCE_OPTIONS;
+  return [...CADENCE_OPTIONS, { value, label: `${value} (unrecognized — runs hourly)` }];
 }
 
-/** Section labels of the LIVE editor's own doc — same-file case, no I/O
- *  needed. Matches toolCapabilityElectron.ts's splitIntoSections() labeling
- *  convention exactly — first section is "" unless a leading
- *  request-separator sets a custom label, same as the real headless engine. */
-function getSameFileSections(editor: any): { index: number; label: string }[] {
-  const doc = editor?.state?.doc;
-  const sections: { index: number; label: string }[] = [{ index: 0, label: "" }];
-  if (!doc) return sections;
-  doc.forEach((node: any) => {
-    if (node.type?.name === "request-separator") {
-      sections.push({ index: sections.length, label: node.attrs?.label || `Request ${sections.length + 1}` });
-    }
-  });
-  return sections;
-}
+// UNSET_SECTION/SectionLabelCell/displaySectionLabel/getSameFileSections
+// now live in ../components/Row.tsx — shared with the tool node's own
+// request-binding field (Pending #3), which needs the identical "pick a
+// real section, not a typed guess" behavior.
 
-/** A dropdown of a file's REAL sections instead of a free-typed label — the
- *  same-file case reads the live editor doc directly (sync, no I/O); a
- *  cross-file pick (via FilePickerCell) fetches the target file's sections
- *  through the registered tool-capability provider. Either way, a picked
- *  value is guaranteed to actually exist, unlike a typed guess. */
-function SectionLabelCell({
-  value, onChange, editor, filePath, disabled,
-}: { value: string; onChange: (v: string) => void; editor: any; filePath: string; disabled?: boolean }) {
-  const provider = useToolCapabilityProvider();
-  const [remoteSections, setRemoteSections] = useState<{ index: number; label: string }[] | null>(null);
-  const [loading, setLoading] = useState(false);
-
-  useEffect(() => {
-    let cancelled = false;
-    if (!filePath) {
-      setRemoteSections(null);
-      return;
-    }
-    if (!provider) return;
-    setLoading(true);
-    provider
-      .getFileSections(filePath)
-      .then((sections) => { if (!cancelled) setRemoteSections(sections); })
-      .catch(() => { if (!cancelled) setRemoteSections([]); })
-      .finally(() => { if (!cancelled) setLoading(false); });
-    return () => { cancelled = true; };
-  }, [filePath, provider]);
-
-  const sections = filePath ? (remoteSections ?? []) : getSameFileSections(editor);
-  const known = new Set(sections.map((s) => s.label));
-  const placeholder = filePath && loading ? "Loading sections…" : "Select a section…";
-
-  const options = [
-    { value: UNSET_SECTION, label: placeholder },
-    // Keeps an already-saved value selectable even if it's not (yet, or no
-    // longer) among the discovered sections — e.g. sections haven't loaded
-    // yet, or the file changed since this row was set up. Never silently
-    // blanks out a saved value. (A stale literal like the old "Request 1"
-    // default falls here too — it won't match any real section anymore.)
-    ...(value !== UNSET_SECTION && !known.has(value) ? [{ value, label: `${value} (not found)` }] : []),
-    ...sections.map((s) => ({ value: s.label, label: displaySectionLabel(s.label) })),
-  ];
-
-  return (
-    <SelectCell
-      grow
-      value={value}
-      onChange={onChange}
-      options={options}
-      disabled={disabled || (!!filePath && loading)}
-    />
-  );
-}
+const emptyRow = (): ToolVerifyEntry => ({ filePath: "", sectionLabel: UNSET_SECTION, role: "happy-path", cadence: "hourly", mode: "live", onFailure: "withdraw" });
 
 export const createToolVerifiesNode = (NodeViewWrapper: any) => {
   const ToolVerifiesComponent = (props: any) => {
     const isImported = !!props.node.attrs.importedFrom;
     const isEditable = props.editor.isEditable && !isImported;
     const rows: ToolVerifyEntry[] = Array.isArray(props.node.attrs.rows) ? props.node.attrs.rows : [];
-    const onFailure: ToolOnFailure = props.node.attrs.onFailure || "withdraw";
 
     const updateRows = (next: ToolVerifyEntry[]) => props.updateAttributes({ rows: next });
     const updateRow = (i: number, patch: Partial<ToolVerifyEntry>) =>
@@ -145,19 +86,8 @@ export const createToolVerifiesNode = (NodeViewWrapper: any) => {
     return (
       <NodeViewWrapper>
         <div className="my-1">
-          <div className="bg-panel border-b border-t border-border px-3 py-1.5 flex items-center gap-3 flex-wrap">
+          <div className="bg-panel border-b border-t border-border px-3 py-1.5">
             <span className="text-xs text-comment font-medium uppercase tracking-wide">Verification</span>
-            <label className="flex items-center gap-1.5 text-xs text-text ml-auto">
-              On failure
-              <select
-                value={onFailure}
-                onChange={(e) => props.updateAttributes({ onFailure: e.target.value })}
-                disabled={!isEditable}
-                className="bg-editor border border-border rounded px-1.5 py-0.5 text-xs font-mono text-text disabled:opacity-50"
-              >
-                {ON_FAILURE_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
-              </select>
-            </label>
           </div>
 
           {rows.length > 0 && (
@@ -168,16 +98,18 @@ export const createToolVerifiesNode = (NodeViewWrapper: any) => {
                 { label: "Role", width: 110 },
                 { label: "Cadence", width: 90 },
                 { label: "Mode", width: 80 },
+                { label: "On failure", width: 90 },
               ]}
             />
           )}
           {rows.map((row, i) => (
             <RowShell key={i} onRemove={() => removeRow(i)} disabled={!isEditable}>
               <SectionLabelCell value={row.sectionLabel} onChange={(v) => updateRow(i, { sectionLabel: v })} editor={props.editor} filePath={row.filePath || ""} disabled={!isEditable} />
-              <FilePickerCell grow value={row.filePath || ""} onChange={(v) => updateRow(i, { filePath: v })} placeholder="defaults to this file" disabled={!isEditable} />
+              <FilePickerCell grow value={row.filePath || ""} onChange={(v) => updateRow(i, { filePath: v })} placeholder="defaults to this file" disabled={!isEditable} ownFilePath={props.editor?.storage?.source} />
               <SelectCell width={110} value={row.role} onChange={(v) => updateRow(i, { role: v as ToolVerifyRole })} options={ROLE_OPTIONS} disabled={!isEditable} />
-              <TextCell width={90} value={row.cadence || ""} onChange={(v) => updateRow(i, { cadence: v })} placeholder="e.g. nightly" disabled={!isEditable} />
+              <SelectCell width={90} value={row.cadence || "hourly"} onChange={(v) => updateRow(i, { cadence: v })} options={cadenceOptionsFor(row.cadence)} disabled={!isEditable} />
               <SelectCell width={80} value={row.mode || "live"} onChange={(v) => updateRow(i, { mode: v as ToolVerifyMode })} options={MODE_OPTIONS} disabled={!isEditable} />
+              <SelectCell width={90} value={row.onFailure || "withdraw"} onChange={(v) => updateRow(i, { onFailure: v as ToolOnFailure })} options={ON_FAILURE_OPTIONS} disabled={!isEditable} />
             </RowShell>
           ))}
           {isEditable && <AddRowButton onClick={addRow} label="Add verification request" />}
@@ -201,7 +133,6 @@ export const createToolVerifiesNode = (NodeViewWrapper: any) => {
     addAttributes() {
       return {
         rows: { default: [] },
-        onFailure: { default: "withdraw" },
         importedFrom: { default: undefined },
       };
     },

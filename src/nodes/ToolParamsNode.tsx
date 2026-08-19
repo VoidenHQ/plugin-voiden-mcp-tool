@@ -21,12 +21,7 @@ const TYPE_OPTIONS: { value: ToolParamType; label: string }[] = [
   { value: "array", label: "array" },
 ];
 
-const SOURCE_OPTIONS = [
-  { value: "environment", label: "environment" },
-  { value: "agent", label: "agent" },
-];
-
-const emptyRow = (): ToolParamDef => ({ name: "", binds: "", type: "string", required: false, description: "", source: "environment" });
+const emptyRow = (): ToolParamDef => ({ name: "", binds: "", type: "string", required: false, description: "", testValue: "" });
 
 export const createToolParamsNode = (NodeViewWrapper: any) => {
   const ToolParamsComponent = (props: any) => {
@@ -52,9 +47,9 @@ export const createToolParamsNode = (NodeViewWrapper: any) => {
                 { label: "Name", width: 110 },
                 { label: "Binds", grow: true },
                 { label: "Type", width: 90 },
-                { label: "Req.", width: 48 },
+                { label: "Mand.", width: 48 },
                 { label: "Description", grow: true },
-                { label: "Source", width: 100 },
+                { label: "Test value", width: 130 },
               ]}
             />
           )}
@@ -65,7 +60,7 @@ export const createToolParamsNode = (NodeViewWrapper: any) => {
               <SelectCell width={90} value={row.type} onChange={(v) => updateRow(i, { type: v as ToolParamType })} options={TYPE_OPTIONS} disabled={!isEditable} />
               <CheckboxCell width={48} checked={row.required} onChange={(v) => updateRow(i, { required: v })} disabled={!isEditable} />
               <TextCell grow value={row.description || ""} onChange={(v) => updateRow(i, { description: v })} placeholder="What the agent should pass here" disabled={!isEditable} />
-              <SelectCell width={100} value={row.source} onChange={(v) => updateRow(i, { source: v as any })} options={SOURCE_OPTIONS} disabled={!isEditable} />
+              <TextCell width={130} value={row.testValue || ""} onChange={(v) => updateRow(i, { testValue: v })} placeholder="used only for verification" disabled={!isEditable} />
             </RowShell>
           ))}
           {isEditable && <AddRowButton onClick={addRow} label="Add parameter" />}

@@ -1,5 +1,19 @@
 [
   {
+    "version": "v0.2.0",
+    "date": "19/08/2026",
+    "title": "Per-Request Verification Policy & Portable File References",
+    "changes": {
+      "Fixed": [
+        "Cross-file request/verify references (the /tool block's \"attach a request\" file picker, and a verify row's optional file override) now save a path relative to the file's own project instead of an absolute path baked to one machine — previously this only worked correctly when the project happened to match whatever directory was globally active in the sidebar, which silently broke for any other project, or a file opened standalone outside a sidebar-known project folder"
+      ],
+      "Changed": [
+        "onFailure is now per verification request instead of one tool-wide setting — each entry decides its own consequence (withdraw the tool, or keep it flagged degraded) when it fails; the most conservative failed entry wins when they disagree. Rows saved before this existed default to 'withdraw', unchanged from the old tool-wide default",
+        "Removed the in-app MCP tab (List/Verify/Serve preview) — it duplicated what voiden-runner mcp serve --check already reports from the CLI, now the source of truth now that publishing/serving lives in its own package. The request-binding file/section pickers and \"Auto-populate params\" still work as before"
+      ]
+    }
+  },
+  {
     "version": "v0.1.0",
     "date": "03/08/2026",
     "title": "Initial Release",

@@ -31,8 +31,9 @@ export function extractTools(blocks: Block[]): any[] {
     requestUid: cfg.requestUid,
     params: cfg.params,
     verifies: cfg.verifies,
-    onFailure: cfg.onFailure,
     enabled: cfg.enabled,
+    requestFilePath: cfg.requestFilePath,
+    requestSectionLabel: cfg.requestSectionLabel,
   }]
 }
 
@@ -49,6 +50,8 @@ const createToolRunner: RunnerFactory = (context: RunnerContext) => {
           annotations: { default: {} },
           requestUid: { default: '' },
           enabled: { default: true },
+          requestFilePath: { default: '' },
+          requestSectionLabel: { default: null },
         },
       })
       context.registerBlockSchema({
@@ -57,7 +60,11 @@ const createToolRunner: RunnerFactory = (context: RunnerContext) => {
       })
       context.registerBlockSchema({
         name: 'toolverifies',
-        attrs: { uid: {}, rows: { default: [] }, onFailure: { default: 'withdraw' } },
+        // No tool-wide `onFailure` here anymore — moved to a per-row attr on
+        // each verify entry (inside `rows`), not a schema-level attr of its
+        // own. A file saved before this migrates on next read/resave, see
+        // toolBlocks.ts's resolveToolBlock().
+        attrs: { uid: {}, rows: { default: [] } },
       })
 
       // Cast to any: registerToolProvider is a host capability not yet in the
