@@ -2,7 +2,7 @@
   "id": "voiden-mcp-tool",
   "name": "Voiden Tool",
   "description": "Mark an existing request as a named, typed capability an AI agent can call directly — instead of only the four generic run/list/write tools every project gets by default.",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "voidenVersion": ">=2.3.1",
   "author": "Voiden Team",
   "priority": 22,

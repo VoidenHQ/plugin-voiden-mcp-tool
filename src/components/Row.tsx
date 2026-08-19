@@ -315,12 +315,12 @@ export function SectionLabelCell({
     if (!provider) return;
     setLoading(true);
     provider
-      .getFileSections(filePath)
+      .getFileSections(filePath, editor?.storage?.source)
       .then((sections) => { if (!cancelled) setRemoteSections(sections); })
       .catch(() => { if (!cancelled) setRemoteSections([]); })
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
-  }, [filePath, provider]);
+  }, [filePath, provider, editor]);
 
   const sections = filePath ? (remoteSections ?? []) : getSameFileSections(editor);
   const known = new Set(sections.map((s) => s.label));
