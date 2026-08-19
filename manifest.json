@@ -2,12 +2,12 @@
   "id": "voiden-mcp-tool",
   "name": "Voiden Tool",
   "description": "Mark an existing request as a named, typed capability an AI agent can call directly — instead of only the four generic run/list/write tools every project gets by default.",
-  "version": "0.2.1",
+  "version": "0.1.0",
   "voidenVersion": ">=2.3.1",
   "author": "Voiden Team",
   "priority": 22,
   "dependencies": {},
-  "readme": "Tool declaration extension. Insert a /tool block on an existing request block, fill in its agent-facing identity (name, description, annotations), declare which parameters the agent controls vs which come from the environment, and list which other requests verify it still works. Verified tools are served as real, individually-named/typed MCP tools by @voiden/mcp-server and voiden-runner mcp serve, alongside the four generic run/list/write ones every project gets by default — with a manual enabled override (add/remove from serving regardless of verification state) available in the block's own attrs.",
+  "readme": "Tool declaration extension. Insert a /tool block on an existing request block, fill in its agent-facing identity (name, description, annotations), declare which parameters the agent controls vs which come from the environment, and list which other requests verify it still works. Verified tools are served as real, individually-named/typed MCP tools by @voiden/mcp and voiden-runner mcp serve, alongside the four generic run/list/write ones every project gets by default — with a manual enabled override (add/remove from serving regardless of verification state) available in the block's own attrs.",
   "capabilities": {
     "blocks": {
       "owns": [
@@ -34,10 +34,10 @@
     "Parameters table with agent-supplied vs environment-only (resolved from the project's env files, never sent to the agent) sources",
     "Verification policy referencing other requests as happy-path/error-contract/auth-check proof the tool works, each with its own live/sandbox/none mode and optional cadence",
     "Per-request onFailure policy — each verification request decides its own consequence (withdraw the tool, or keep it flagged degraded); the most conservative failed one wins when they disagree",
-    "Dynamic MCP serving — verified tools become real, named/typed tools in @voiden/mcp-server and voiden-runner mcp serve, alongside the 4 built-in ones",
+    "Dynamic MCP serving — verified tools become real, named/typed tools in @voiden/mcp and voiden-runner mcp serve, alongside the 4 built-in ones",
     "Manual enabled override — add or remove a tool from what's served regardless of its verification state",
     "voiden-runner tool list / tool verify — project-wide discovery and pass/fail verification from the CLI",
     "voiden-runner mcp serve --check — reports served/withdrawn/degraded/excluded without starting a live session",
-    "Cross-file request/verify references now save a portable relative path (resolved against the file's own project) instead of an absolute path baked to one machine"
+    "Cross-file request/verify references save a portable relative path, resolved against the referencing file's own project"
   ]
 }
