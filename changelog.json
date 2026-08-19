@@ -1,38 +1,16 @@
 [
   {
-    "version": "v0.2.1",
-    "date": "19/08/2026",
-    "title": "Fix: Cross-File References Still Resolved Against the Wrong Project",
-    "changes": {
-      "Fixed": [
-        "The v0.2.0 fix only covered saving a cross-file reference (the /tool block's \"attach a request\" picker, a verify row's file override) as a path relative to the file's own project — reading it back (\"Auto-populate params\", the verify row's section-label dropdown) still resolved that relative path against whatever project was globally active in the sidebar, not the file's own. When those differ, this silently read the wrong file (or nothing) instead of the intended one — most visibly as a false \"No {{placeholders}} found in that request — nothing to add\" on Auto-populate. Both the save and read paths now resolve against the same project root: the one that actually owns the file the reference lives in"
-      ]
-    }
-  },
-  {
-    "version": "v0.2.0",
-    "date": "19/08/2026",
-    "title": "Per-Request Verification Policy & Portable File References",
-    "changes": {
-      "Fixed": [
-        "Cross-file request/verify references (the /tool block's \"attach a request\" file picker, and a verify row's optional file override) now save a path relative to the file's own project instead of an absolute path baked to one machine — previously this only worked correctly when the project happened to match whatever directory was globally active in the sidebar, which silently broke for any other project, or a file opened standalone outside a sidebar-known project folder"
-      ],
-      "Changed": [
-        "onFailure is now per verification request instead of one tool-wide setting — each entry decides its own consequence (withdraw the tool, or keep it flagged degraded) when it fails; the most conservative failed entry wins when they disagree. Rows saved before this existed default to 'withdraw', unchanged from the old tool-wide default",
-        "Removed the in-app MCP tab (List/Verify/Serve preview) — it duplicated what voiden-runner mcp serve --check already reports from the CLI, now the source of truth now that publishing/serving lives in its own package. The request-binding file/section pickers and \"Auto-populate params\" still work as before"
-      ]
-    }
-  },
-  {
     "version": "v0.1.0",
     "date": "03/08/2026",
     "title": "Initial Release",
     "description": "Tool declaration block for .void files — mark an existing request as a named, typed capability an AI agent can call directly.",
     "changes": {
       "Added": [
-        "Tool block (/tool) with identity (name/title/description/annotations), a parameters table (agent-supplied vs environment-only source), and a verification policy (verifies rows with role/cadence/mode, plus a tool-level on-failure)",
-        "Dynamic MCP serving — a verified tool is registered as a real, individually-named/described/typed MCP tool by @voiden/mcp-server and voiden-runner mcp serve, alongside the 4 generic run/list/write tools every project already gets. A failing tool is withdrawn by default, or served with a degraded note if onFailure: advertise-degraded",
-        "Manual enabled override on the tool block — add or remove it from the served set regardless of verification state, editable from the Voiden app's MCP tab (List / Verify / Serve preview)",
+        "Tool block (/tool) with identity (name/title/description/annotations), a parameters table (agent-supplied vs environment-only source), and a verification policy (verifies rows with role/cadence/mode, plus a per-request on-failure)",
+        "onFailure is per verification request, not one tool-wide setting — each entry decides its own consequence (withdraw the tool, or keep it flagged degraded) when it fails; the most conservative failed entry wins when they disagree",
+        "Dynamic MCP serving — a verified tool is registered as a real, individually-named/described/typed MCP tool by @voiden/mcp and voiden-runner mcp serve, alongside the 4 generic run/list/write tools every project already gets. A failing tool is withdrawn by default, or served with a degraded note if onFailure: advertise-degraded",
+        "Manual enabled override on the tool block — add or remove it from the served set regardless of verification state",
+        "Cross-file request/verify references (the /tool block's \"attach a request\" file picker, and a verify row's optional file override) save a path relative to the referencing file's own project, resolved the same way on read — so the reference survives being cloned to a different machine or opened outside whatever project happens to be active in the sidebar",
         "Environment-sourced params resolve from the project's .voiden/env-public.yaml / env-private.yaml when it has exactly one environment defined, not just the server process's own OS environment",
         "A verify entry (or a tool's own request) targeting a file with no request-separators — i.e. just one request, nothing to disambiguate — no longer needs its sectionLabel to match anything",
         "voiden-runner tool list — discovers every /tool block across a project",
