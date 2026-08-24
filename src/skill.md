@@ -4,6 +4,8 @@ Provides `tool`, `toolparams`, and `toolverifies` block types for marking a requ
 
 `@voiden/mcp-server` verifies every `/tool` block at startup, before an agent connects, and only registers the ones that pass — see "Verification and serving" below. Presence of a `tool` block is the *only* thing that exposes a request to an agent; nothing else in a project is visible to one.
 
+> **Singleton per section:** `tool` is allowed at most once per section — a section declares at most one agent-callable tool.
+
 ### tool — Tool Container
 
 `tool` is a **container** block that wraps `toolparams` and `toolverifies` children. It lives in the **same section** as the request it decorates — reference, don't nest: the request stays an ordinary, runnable-by-a-human request; `tool` only annotates it.

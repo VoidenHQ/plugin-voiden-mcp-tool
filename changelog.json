@@ -1,5 +1,15 @@
 [
   {
+    "version": "v0.1.1",
+    "date": "24/08/2026",
+    "title": "Docs: Skill Now Documents Singleton Block Rule",
+    "changes": {
+      "Fixed": [
+        "The bundled skill.md now documents that a tool declaration is allowed at most once per request section. Previously undocumented, which could lead an AI agent to insert a second tool block instead of editing the existing one."
+      ]
+    }
+  },
+  {
     "version": "v0.1.0",
     "date": "03/08/2026",
     "title": "Initial Release",
