@@ -208,7 +208,7 @@ content:
 ### Two ways to serve
 
 - **`@voiden/mcp-server`** — stdio only, published to npm, auto-registered with Claude Code/Codex by the Voiden app's Settings toggle or `voiden-runner mcp install`. What most people use.
-- **`voiden-runner mcp serve [path] [--http] [--port <n>] [--host <addr>]`** — the same tool set (4 fixed tools plus declared `/tool` capabilities), built into `voiden-runner` itself, for CLI-only users with no Voiden app installed. Defaults to stdio; `--http` serves streamable-HTTP instead, bound to `127.0.0.1` only unless `--host` explicitly opts into wider exposure (prints a warning when it does).
+- **`voiden-runner mcp serve [path] [--http] [--port <n>] [--host <addr>]`** — the same tool set (6 fixed tools — list void files, list requests, run request, write result, list environments, select environment — plus declared `/tool` capabilities), built into `voiden-runner` itself, for CLI-only users with no Voiden app installed. Defaults to stdio; `--http` serves streamable-HTTP instead, bound to `127.0.0.1` only unless `--host` explicitly opts into wider exposure (prints a warning when it does).
 
 ### Notes
 
