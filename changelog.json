@@ -1,5 +1,15 @@
 [
   {
+    "version": "v0.1.2",
+    "date": "10/09/2026",
+    "title": "Docs: Fixed-Tool Count Corrected to Six",
+    "changes": {
+      "Fixed": [
+        "The bundled skill.md said voiden-runner mcp serve exposes 4 fixed tools alongside verified /tool blocks. It now exposes 6 — list_environments and select_environment were added and this doc never caught up, understating what an agent connected to the project actually has available."
+      ]
+    }
+  },
+  {
     "version": "v0.1.1",
     "date": "24/08/2026",
     "title": "Docs: Skill Now Documents Singleton Block Rule",
